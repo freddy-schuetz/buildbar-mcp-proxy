@@ -136,19 +136,27 @@ app.get('/auth/callback', async (req, res) => {
     if (!repo) throw new Error('Konnte keinen freien Repo-Namen finden.');
     const owner = repo.owner.login, name = repo.name;
 
-    // .mcp.json auf main setzen (Template bringt evtl. schon eine mit -> sha; generate kann kurz nachlaufen -> retry)
+    // WICHTIG: GitHub-"generate" ist ASYNCHRON. Erst warten, bis das Repo wirklich
+    // befuellt ist (Template-.mcp.json existiert -> sha), DANN ueberschreiben. Sonst
+    // legt der generate-Initial-Commit unsere .mcp.json wieder platt (Race-Condition).
     const mcpUrl = HUB_BASE + '/g/' + state + '/mcp';
     const mcp = JSON.stringify({ mcpServers: { 'n8n-mcp': { type: 'http', url: mcpUrl } } }, null, 2) + '\n';
+    let sha = null;
+    for (let a = 0; a < 30; a++) {
+      const g = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json');
+      if (g.ok) { sha = (await g.json()).sha; break; }
+      await new Promise(r => setTimeout(r, 1000));
+    }
     let done = false, lastErr = '';
-    for (let a = 0; a < 6 && !done; a++) {
-      if (a) await new Promise(r => setTimeout(r, 1500));
-      let sha;
-      try { const g = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json'); if (g.ok) sha = (await g.json()).sha; } catch (e) {}
+    for (let a = 0; a < 5 && !done; a++) {
       const put1 = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json', {
         method: 'PUT', body: JSON.stringify({ message: 'n8n verbunden', content: Buffer.from(mcp).toString('base64'), ...(sha ? { sha } : {}) })
       });
       if (put1.status < 300) { done = true; break; }
       lastErr = put1.status + ' ' + (await put1.text()).slice(0, 150);
+      const g = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json'); // sha evtl. veraltet -> neu holen
+      if (g.ok) sha = (await g.json()).sha;
+      await new Promise(r => setTimeout(r, 1500));
     }
     if (!done) throw new Error('.mcp.json setzen fehlgeschlagen: ' + lastErr);
 
