@@ -215,6 +215,14 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
       const app = await cr.json();
       rec.appUuid = app.uuid; rec.appDomain = domain; rec.baseDir = baseDir;
       await cf('/applications/' + rec.appUuid, { method: 'PATCH', body: JSON.stringify({ domains: domain }) });
+      // optionale Env-Variablen (KEY=VALUE je Zeile) VOR dem ersten Build setzen (z.B. NEXT_PUBLIC_SUPABASE_URL, Anon-Key, n8n-Webhook)
+      const envRaw = String((req.body && req.body.env) || '');
+      for (const line of envRaw.split(/\r?\n/)) {
+        const i = line.indexOf('='); if (i < 1) continue;
+        const k = line.slice(0, i).trim(), v = line.slice(i + 1).trim();
+        if (!k) continue;
+        try { await cf('/applications/' + rec.appUuid + '/envs', { method: 'POST', body: JSON.stringify({ key: k, value: v, is_preview: false, is_build_time: true }) }); } catch (e) {}
+      }
       store.set(token, rec); persist();
     }
     await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
