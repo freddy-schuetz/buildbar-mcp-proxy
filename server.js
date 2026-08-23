@@ -95,6 +95,18 @@ app.post('/register', express.urlencoded({ extended: false, limit: '16kb' }), (r
   res.type('html').send(successHtml(mcpUrl));
 });
 
+// --- JSON-API fuer connect.sh: registriert url+key server-seitig, gibt anonyme URL zurueck ---
+app.post('/api/register', express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' }), (req, res) => {
+  const url = String((req.body && req.body.url) || '').trim().replace(/\/+$/, '');
+  const key = String((req.body && req.body.key) || '').trim();
+  if (!/^https:\/\/[^\s/]+\.[^\s]+$/i.test(url)) return res.status(400).json({ error: 'ungueltige n8n-URL' });
+  if (key.length < 20) return res.status(400).json({ error: 'API-Key zu kurz' });
+  const token = crypto.randomBytes(16).toString('hex');
+  store.set(token, { url, key });
+  persist();
+  res.json({ mcpUrl: 'https://' + req.headers.host + '/g/' + token + '/mcp' });
+});
+
 app.listen(PORT, () => console.log('buildbar hub on', PORT, '-> upstream', UPSTREAM));
 
 // ---------- HTML ----------
