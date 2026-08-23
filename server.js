@@ -59,7 +59,27 @@ app.use((req, res, next) => {
   proxy.web(req, res, { target: UPSTREAM });
 });
 
-// --- Self-Service-Registrierung ---
+// --- Selbst-enthaltene Capability-URL: /c/<base64url(url|key)>/mcp ---
+// Claude im Projekt baut diese URL lokal (kein Server-Round-Trip noetig). Der Hub
+// dekodiert url+key aus dem Pfad und injiziert die Header. Muss ebenfalls VOR jedem
+// Body-Parser stehen (Stream unangetastet).
+app.use((req, res, next) => {
+  const m = req.path.match(/^\/c\/([A-Za-z0-9_-]+)\/mcp\/?$/);
+  if (!m) return next();
+  let url, key;
+  try {
+    const raw = Buffer.from(m[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const i = raw.indexOf('|');
+    if (i < 0) throw new Error('sep');
+    url = raw.slice(0, i); key = raw.slice(i + 1);
+    if (!/^https:\/\//i.test(url) || key.length < 10) throw new Error('shape');
+  } catch (e) { res.status(400).type('application/json').send('{"error":"ungueltige Verbindungs-URL"}'); return; }
+  req.tenant = { url, key };
+  req.url = '/mcp';
+  proxy.web(req, res, { target: UPSTREAM });
+});
+
+// --- Self-Service-Registrierung (alternativer Weg ueber die Seite) ---
 app.get('/', (req, res) => res.type('html').send(formHtml()));
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
 
