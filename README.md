@@ -1,21 +1,23 @@
-# buildbar-mcp-proxy
+# buildbar-mcp-hub
 
-Capability-URL-Weiterleitung vor den Multi-Tenant-n8n-mcp.
+Self-Service-Weiterleitung vor dem Multi-Tenant-n8n-mcp.
 
-**Zweck:** Teilnehmer-Repos brauchen dann **keinen Token und keine custom Header** in
-der `.mcp.json` — nur eine nicht-erratbare URL:
+**Zweck:** Jeder Teilnehmer nutzt seine **eigene** n8n-Instanz. Auf `https://hub.buildbar.at`
+traegt er n8n-URL + API-Key ein und bekommt eine **persoenliche Verbindungs-URL**:
 
 ```json
-{ "mcpServers": { "n8n-mcp": { "type": "http", "url": "https://hub.buildbar.at/g/<GRUPPEN-KEY>/mcp" } } }
+{ "mcpServers": { "n8n-mcp": { "type": "http", "url": "https://hub.buildbar.at/g/<TOKEN>/mcp" } } }
 ```
 
-Der Proxy (Caddy) injiziert `Authorization`, `x-n8n-url`, `x-n8n-key` **server-seitig**
-aus ENV und leitet an `https://mcp.buildbar.at` weiter. Dadurch:
+Der Hub speichert `{token -> (url, key)}` **server-seitig**, injiziert bei jedem Aufruf
+`Authorization` + `x-n8n-url` + `x-n8n-key` und leitet an `mcp.buildbar.at` weiter. Dadurch:
 
-- Teilnehmer-Repo kann **public** sein (kein Geheimnis drin) → eigener GitHub reicht, keine Einladung.
-- **Umgeht** die fehlende Custom-Header-Weitergabe von claude.ai/code (das Repo hat gar keine Header).
+- Teilnehmer-Repo enthaelt **nur die URL** -> kein Key im Repo, Repo darf **public** sein.
+- **Keine custom Header** noetig (claude.ai/code reicht die eh nicht durch).
+- Eigene n8n pro Teilnehmer, **im Prozess abgefragt** (Formular).
 
-**ENV (in Coolify setzen, nicht hier committen):**
-`DEMO_KEY`, `MCP_AUTH_TOKEN`, `DEMO_N8N_URL`, `DEMO_N8N_KEY`.
+**ENV (Coolify):** `MCP_AUTH_TOKEN` (Token des Multi-Tenant-Servers), `MCP_UPSTREAM`
+(Default `https://mcp.buildbar.at`), optional `DATA_FILE` (Default `/data/tokens.json`;
+mit Volume ueberleben Registrierungen einen Redeploy).
 
-Pro weiterer Gruppe: eigenen `@grp`-Block + eigene ENV (eigener KEY, eigene n8n-Creds).
+Node + Express + http-proxy. Laeuft auf :80 hinter Coolifys Traefik.
