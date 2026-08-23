@@ -1,0 +1,28 @@
+{
+	admin off
+	auto_https off
+}
+
+# buildbar MCP Hub — Capability-URL-Weiterleitung.
+# Teilnehmer-.mcp.json enthaelt NUR die URL https://hub.buildbar.at/g/<KEY>/mcp
+# (keine Header, kein Token). Dieser Proxy injiziert Token + n8n-Routing
+# server-seitig und leitet an den Multi-Tenant-n8n-mcp weiter.
+# Alle Geheimnisse kommen aus ENV (Coolify), NICHT aus diesem oeffentlichen Repo.
+# Laeuft auf :80 hinter Coolifys Traefik (das TLS fuer hub.buildbar.at macht).
+
+:80 {
+	@grp path /g/{$DEMO_KEY}/mcp /g/{$DEMO_KEY}/mcp/*
+	handle @grp {
+		uri replace /g/{$DEMO_KEY} ""
+		reverse_proxy https://mcp.buildbar.at {
+			header_up Host mcp.buildbar.at
+			header_up Authorization "Bearer {$MCP_AUTH_TOKEN}"
+			header_up x-n8n-url "{$DEMO_N8N_URL}"
+			header_up x-n8n-key "{$DEMO_N8N_KEY}"
+		}
+	}
+
+	handle {
+		respond "buildbar mcp hub" 200
+	}
+}
