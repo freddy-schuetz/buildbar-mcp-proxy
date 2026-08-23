@@ -21,6 +21,7 @@ const GH_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
 const GH_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 const HUB_BASE = process.env.HUB_BASE || 'https://hub.buildbar.at';
 const REPO_NAME = process.env.REPO_NAME || 'buildbar-hackathon';
+const TEMPLATE_REPO = process.env.TEMPLATE_REPO || 'freddy-schuetz/nrw-tourismus-hackathon-web';
 
 // token -> { url, key }
 const store = new Map();
@@ -102,31 +103,46 @@ app.get('/auth/callback', async (req, res) => {
       ...opts, headers: { 'Authorization': 'Bearer ' + ght, 'Accept': 'application/vnd.github+json', 'User-Agent': 'buildbar-hub', 'Content-Type': 'application/json', ...(opts.headers || {}) }
     });
 
-    // Repo anlegen (bei Namenskollision Suffix)
+    // Teilnehmer-Login ermitteln (fuer generate-owner)
+    const meRes = await gh('/user');
+    const login = meRes.ok ? (await meRes.json()).login : null;
+    if (!login) throw new Error('GitHub-Login nicht ermittelbar.');
+    const tParts = TEMPLATE_REPO.split('/');
+
+    // Repo AUS DEM TEMPLATE generieren (alles drin: Skills, Docs, Starter) - bei Kollision Suffix
     let repo = null;
     for (let a = 0; a < 4; a++) {
       const nm = a === 0 ? REPO_NAME : REPO_NAME + '-' + crypto.randomBytes(2).toString('hex');
-      const cr = await gh('/user/repos', { method: 'POST', body: JSON.stringify({ name: nm, private: true, auto_init: true, description: 'buildbar Hackathon-Projekt (n8n verbunden)' }) });
+      let cr;
+      if (tParts.length === 2) {
+        cr = await gh('/repos/' + tParts[0] + '/' + tParts[1] + '/generate', {
+          method: 'POST', headers: { 'Accept': 'application/vnd.github+json' },
+          body: JSON.stringify({ owner: login, name: nm, private: true, include_all_branches: false })
+        });
+      } else {
+        cr = await gh('/user/repos', { method: 'POST', body: JSON.stringify({ name: nm, private: true, auto_init: true }) });
+      }
       if (cr.status === 201) { repo = await cr.json(); break; }
       if (cr.status !== 422) throw new Error('Repo-Erstellung fehlgeschlagen (' + cr.status + '): ' + (await cr.text()).slice(0, 200));
     }
     if (!repo) throw new Error('Konnte keinen freien Repo-Namen finden.');
     const owner = repo.owner.login, name = repo.name;
 
+    // .mcp.json auf main setzen (Template bringt evtl. schon eine mit -> sha; generate kann kurz nachlaufen -> retry)
     const mcpUrl = HUB_BASE + '/g/' + state + '/mcp';
     const mcp = JSON.stringify({ mcpServers: { 'n8n-mcp': { type: 'http', url: mcpUrl } } }, null, 2) + '\n';
-    const put1 = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json', {
-      method: 'PUT', body: JSON.stringify({ message: 'n8n verbunden', content: Buffer.from(mcp).toString('base64') })
-    });
-    if (put1.status >= 300) throw new Error('.mcp.json anlegen fehlgeschlagen (' + put1.status + '): ' + (await put1.text()).slice(0, 200));
-
-    // README ersetzen (Fehler hier egal)
-    try {
-      const rr = await gh('/repos/' + owner + '/' + name + '/contents/README.md');
-      const sha = rr.ok ? (await rr.json()).sha : undefined;
-      const readme = '# buildbar - dein Hackathon-Projekt\n\nDeine n8n ist **verbunden**. Oeffne dieses Projekt in claude.ai/code und tippe:\n\n> **pruefe meine n8n-Verbindung und liste meine Workflows auf**\n\nDann einfach beschreiben, was du bauen willst.\n';
-      await gh('/repos/' + owner + '/' + name + '/contents/README.md', { method: 'PUT', body: JSON.stringify({ message: 'Anleitung', content: Buffer.from(readme).toString('base64'), sha }) });
-    } catch (e) { /* egal */ }
+    let done = false, lastErr = '';
+    for (let a = 0; a < 6 && !done; a++) {
+      if (a) await new Promise(r => setTimeout(r, 1500));
+      let sha;
+      try { const g = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json'); if (g.ok) sha = (await g.json()).sha; } catch (e) {}
+      const put1 = await gh('/repos/' + owner + '/' + name + '/contents/.mcp.json', {
+        method: 'PUT', body: JSON.stringify({ message: 'n8n verbunden', content: Buffer.from(mcp).toString('base64'), ...(sha ? { sha } : {}) })
+      });
+      if (put1.status < 300) { done = true; break; }
+      lastErr = put1.status + ' ' + (await put1.text()).slice(0, 150);
+    }
+    if (!done) throw new Error('.mcp.json setzen fehlgeschlagen: ' + lastErr);
 
     res.type('html').send(doneHtml(repo.html_url, repo.full_name));
   } catch (e) {
