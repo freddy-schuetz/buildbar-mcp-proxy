@@ -31,6 +31,9 @@ const DEPLOY_KEY_UUID = process.env.DEPLOY_KEY_UUID || '';
 const DEPLOY_PUBKEY = process.env.DEPLOY_PUBKEY || '';
 const DEPLOY_DOMAIN_BASE = process.env.DEPLOY_DOMAIN_BASE || 'buildbar.at';
 
+// Coolify-API-Helfer (fuer Deploy-Key-Registrierung + App-Erstellung)
+const cf = (p, opts = {}) => fetch(COOLIFY_API + p, { ...opts, headers: { 'Authorization': 'Bearer ' + COOLIFY_TOKEN, 'Content-Type': 'application/json', 'Accept': 'application/json', ...(opts.headers || {}) } });
+
 // token -> { url, key }
 const store = new Map();
 try {
@@ -160,13 +163,23 @@ app.get('/auth/callback', async (req, res) => {
     }
     if (!done) throw new Error('.mcp.json setzen fehlgeschlagen: ' + lastErr);
 
-    // Read-only Deploy-Key ins Repo -> ermoeglicht spaeteres On-Demand-Frontend-Deploy (nichts wird jetzt deployt)
-    if (DEPLOY_PUBKEY) {
+    // EINDEUTIGER read-only Deploy-Key pro Repo -> On-Demand-Frontend-Deploy moeglich.
+    // (GitHub erlaubt denselben Deploy-Key nur bei EINEM Repo global -> pro Repo ein eigener!)
+    if (COOLIFY_TOKEN) {
       try {
-        await gh('/repos/' + owner + '/' + name + '/keys', { method: 'POST', body: JSON.stringify({ title: 'buildbar-deploy', key: DEPLOY_PUBKEY, read_only: true }) });
+        const fs = require('fs');
+        const kp = '/tmp/dk-' + state;
+        require('child_process').execSync("ssh-keygen -t ed25519 -N '' -q -f " + kp + " -C buildbar-" + name);
+        const pub = fs.readFileSync(kp + '.pub', 'utf8').trim();
+        const priv = fs.readFileSync(kp, 'utf8');
+        try { fs.unlinkSync(kp); fs.unlinkSync(kp + '.pub'); } catch (e) {}
+        const kr = await cf('/security/keys', { method: 'POST', body: JSON.stringify({ name: 'deploy-' + name, private_key: priv }) });
+        const kj = await kr.json().catch(() => ({}));
+        await gh('/repos/' + owner + '/' + name + '/keys', { method: 'POST', body: JSON.stringify({ title: 'buildbar-deploy', key: pub, read_only: true }) });
+        if (kj && kj.uuid) tenant.deployKeyUuid = kj.uuid;
       } catch (e) { /* nicht kritisch */ }
     }
-    // Repo mit dem Verbindungs-Token merken (fuer /deploy)
+    // Repo (+ Deploy-Key-UUID) mit dem Verbindungs-Token merken (fuer /deploy)
     tenant.repo = owner + '/' + name;
     store.set(state, tenant);
     persist();
@@ -184,8 +197,8 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
   if (baseDir[0] !== '/') baseDir = '/' + baseDir;
   const rec = store.get(token);
   if (!rec || !rec.repo) return res.status(404).json({ error: 'unbekannter Token oder kein Repo hinterlegt' });
-  if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER || !DEPLOY_KEY_UUID) return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert' });
-  const cf = (p, opts = {}) => fetch(COOLIFY_API + p, { ...opts, headers: { 'Authorization': 'Bearer ' + COOLIFY_TOKEN, 'Content-Type': 'application/json', 'Accept': 'application/json', ...(opts.headers || {}) } });
+  const keyUuid = rec.deployKeyUuid || DEPLOY_KEY_UUID;
+  if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER || !keyUuid) return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert (kein Deploy-Key)' });
   try {
     if (!rec.appUuid) {
       const sub = 'app-' + token.slice(0, 8);
@@ -194,7 +207,7 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
         method: 'POST', body: JSON.stringify({
           project_uuid: COOLIFY_PROJECT, server_uuid: COOLIFY_SERVER, environment_name: 'production',
           git_repository: 'git@github.com:' + rec.repo + '.git', git_branch: 'main',
-          private_key_uuid: DEPLOY_KEY_UUID, build_pack: 'nixpacks', ports_exposes: '3000',
+          private_key_uuid: keyUuid, build_pack: 'nixpacks', ports_exposes: '3000',
           base_directory: baseDir, name: sub, instant_deploy: false
         })
       });
