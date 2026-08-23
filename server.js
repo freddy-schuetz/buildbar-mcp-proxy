@@ -22,6 +22,14 @@ const GH_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 const HUB_BASE = process.env.HUB_BASE || 'https://hub.buildbar.at';
 const REPO_NAME = process.env.REPO_NAME || 'buildbar-hackathon';
 const TEMPLATE_REPO = process.env.TEMPLATE_REPO || 'freddy-schuetz/nrw-tourismus-hackathon-web';
+// Frontend-Deploy (on-demand)
+const COOLIFY_TOKEN = process.env.COOLIFY_TOKEN || '';
+const COOLIFY_API = process.env.COOLIFY_API || 'http://coolify:8080/api/v1';
+const COOLIFY_PROJECT = process.env.COOLIFY_PROJECT || '';
+const COOLIFY_SERVER = process.env.COOLIFY_SERVER || '';
+const DEPLOY_KEY_UUID = process.env.DEPLOY_KEY_UUID || '';
+const DEPLOY_PUBKEY = process.env.DEPLOY_PUBKEY || '';
+const DEPLOY_DOMAIN_BASE = process.env.DEPLOY_DOMAIN_BASE || 'buildbar.at';
 
 // token -> { url, key }
 const store = new Map();
@@ -144,9 +152,54 @@ app.get('/auth/callback', async (req, res) => {
     }
     if (!done) throw new Error('.mcp.json setzen fehlgeschlagen: ' + lastErr);
 
+    // Read-only Deploy-Key ins Repo -> ermoeglicht spaeteres On-Demand-Frontend-Deploy (nichts wird jetzt deployt)
+    if (DEPLOY_PUBKEY) {
+      try {
+        await gh('/repos/' + owner + '/' + name + '/keys', { method: 'POST', body: JSON.stringify({ title: 'buildbar-deploy', key: DEPLOY_PUBKEY, read_only: true }) });
+      } catch (e) { /* nicht kritisch */ }
+    }
+    // Repo mit dem Verbindungs-Token merken (fuer /deploy)
+    tenant.repo = owner + '/' + name;
+    store.set(state, tenant);
+    persist();
+
     res.type('html').send(doneHtml(repo.html_url, repo.full_name));
   } catch (e) {
     res.status(500).type('html').send(errHtml('Etwas ist schiefgelaufen: ' + String((e && e.message) || e)));
+  }
+});
+
+// --- On-Demand Frontend-Deploy: Coolify-App aus dem Repo (nur wenn der Teilnehmer es will) ---
+app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' }), async (req, res) => {
+  const token = String((req.body && req.body.token) || '').trim();
+  let baseDir = String((req.body && req.body.base_dir) || '').trim() || '/frontend-starter';
+  if (baseDir[0] !== '/') baseDir = '/' + baseDir;
+  const rec = store.get(token);
+  if (!rec || !rec.repo) return res.status(404).json({ error: 'unbekannter Token oder kein Repo hinterlegt' });
+  if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER || !DEPLOY_KEY_UUID) return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert' });
+  const cf = (p, opts = {}) => fetch(COOLIFY_API + p, { ...opts, headers: { 'Authorization': 'Bearer ' + COOLIFY_TOKEN, 'Content-Type': 'application/json', 'Accept': 'application/json', ...(opts.headers || {}) } });
+  try {
+    if (!rec.appUuid) {
+      const sub = 'app-' + token.slice(0, 8);
+      const domain = 'https://' + sub + '.' + DEPLOY_DOMAIN_BASE;
+      const cr = await cf('/applications/private-deploy-key', {
+        method: 'POST', body: JSON.stringify({
+          project_uuid: COOLIFY_PROJECT, server_uuid: COOLIFY_SERVER, environment_name: 'production',
+          git_repository: 'git@github.com:' + rec.repo + '.git', git_branch: 'main',
+          private_key_uuid: DEPLOY_KEY_UUID, build_pack: 'nixpacks', ports_exposes: '3000',
+          base_directory: baseDir, name: sub, instant_deploy: false
+        })
+      });
+      if (cr.status !== 201) return res.status(500).json({ error: 'App-Erstellung fehlgeschlagen (' + cr.status + '): ' + (await cr.text()).slice(0, 250) });
+      const app = await cr.json();
+      rec.appUuid = app.uuid; rec.appDomain = domain; rec.baseDir = baseDir;
+      await cf('/applications/' + rec.appUuid, { method: 'PATCH', body: JSON.stringify({ domains: domain }) });
+      store.set(token, rec); persist();
+    }
+    await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
+    res.json({ url: rec.appDomain, app: rec.appUuid, status: 'deploying', hint: 'Erster Build dauert 1-2 Minuten.' });
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
   }
 });
 
