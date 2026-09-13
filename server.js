@@ -83,7 +83,7 @@ app.post('/start', express.urlencoded({ extended: false, limit: '16kb' }), (req,
   const url = String((req.body && req.body.url) || '').trim().replace(/\/+$/, '');
   const key = String((req.body && req.body.key) || '').trim();
   if (!/^https:\/\/[^\s/]+\.[^\s]+$/i.test(url)) return res.status(400).type('html').send(errHtml('Bitte eine gültige n8n-URL (https://…) eingeben.'));
-  if (key.length < 20) return res.status(400).type('html').send(errHtml('Der API-Key sieht zu kurz aus – bitte prüfen.'));
+  if (key.length < 20) return res.status(400).type('html').send(errHtml('Der API-Key sieht zu kurz aus. Bitte prüfen.'));
   if (!GH_CLIENT_ID || !GH_CLIENT_SECRET) return res.status(503).type('html').send(errHtml('Die GitHub-Anmeldung ist auf diesem Hub noch nicht konfiguriert.'));
   const token = crypto.randomBytes(16).toString('hex');
   store.set(token, { url, key });
@@ -255,33 +255,33 @@ function page(title, body) {
     '<title>' + title + '</title><style>' + CSS + '</style></head><body>' + body + '</body></html>';
 }
 function formHtml() {
-  return page('buildbar – n8n verbinden',
-    '<h1>Dein Hackathon-Projekt einrichten</h1>' +
-    '<p>Zwei Angaben, eine GitHub-Anmeldung – danach legen wir dir ein <b>fertig verbundenes</b> Projekt an. Kein Datei-Basteln. Dein API-Key bleibt <b>auf dem Server</b> und landet nie in einem Repo.</p>' +
+  return page('buildbar: n8n verbinden',
+    '<h1>Dein Bootcamp-Projekt einrichten</h1>' +
+    '<p>AI Automation Bootcamp der Österreich Werbung. Zwei Angaben und eine GitHub-Anmeldung, danach bekommst du ein <b>fertig verbundenes</b> Projekt. Der API-Key bleibt <b>auf dem Server</b> und landet nie in einem Repository.</p>' +
     '<form method="post" action="/start">' +
     '<label>1. Deine n8n-URL</label>' +
-    '<input name="url" inputmode="url" placeholder="https://deine-instanz.app.n8n.cloud" required>' +
-    '<small>Die Adresse deiner n8n, ohne / am Ende.</small>' +
+    '<input name="url" inputmode="url" placeholder="https://n8n-oew.buildbar.at" required>' +
+    '<small>Die Adresse der n8n ohne / am Ende. Für die zentrale Bootcamp-n8n steht sie im Zugangsbereich auf buildbar.at/oew.</small>' +
     '<label>2. Dein n8n API-Key</label>' +
     '<input name="key" placeholder="eyJ..." required>' +
-    '<small>In n8n: Einstellungen → n8n API → API Key erstellen.</small>' +
+    '<small>Zentrale Bootcamp-n8n: API-Key aus dem Zugangsbereich. Eigene n8n: Einstellungen, n8n API, API Key erstellen. Die kostenlose n8n-Cloud-Testversion hat keinen API-Zugang.</small>' +
     '<button type="submit">Weiter mit GitHub →</button>' +
-    '<small style="margin-top:14px">Im nächsten Schritt meldest du dich bei GitHub an. buildbar legt dir damit dein privates Projekt-Repo an.</small>' +
+    '<small style="margin-top:14px">Im nächsten Schritt meldest du dich bei GitHub an. buildbar legt dir damit dein privates Projekt-Repository an.</small>' +
     '</form>');
 }
 function doneHtml(repoUrl, fullName) {
-  return page('buildbar – fertig',
+  return page('buildbar: fertig',
     '<h1>Projekt ist fertig &amp; verbunden 🎉</h1>' +
     '<p>Dein privates Projekt-Repo wurde angelegt:</p>' +
     '<div class="box"><code>' + fullName + '</code></div>' +
     '<h2>Jetzt loslegen</h2><ol>' +
     '<li>Öffne <a href="https://claude.ai/code" target="_blank" rel="noopener">claude.ai/code</a> und melde dich an.</li>' +
     '<li>Verbinde dort dein GitHub (falls noch nicht) und wähle das Projekt <b>' + fullName + '</b> aus.</li>' +
-    '<li>Tippe einfach: <b>„Los geht\'s"</b> – Claude begrüßt dich, prüft die Verbindung und fragt, was du bauen möchtest.</li>' +
+    '<li>Tippe einfach: <b>„Los geht\'s"</b>. Claude begrüßt dich, prüft die Verbindung und fragt nach deinem Vorhaben.</li>' +
     '</ol>' +
     '<p><a href="' + repoUrl + '" target="_blank" rel="noopener">Repo auf GitHub ansehen</a></p>' +
-    '<p><small>Deine n8n-Verbindung ist bereits im Projekt hinterlegt (nur eine anonyme URL, kein Key) – auch die Skills sind schon dabei. Du musst nichts weiter einrichten.</small></p>');
+    '<p><small>Die n8n-Verbindung ist bereits im Projekt hinterlegt (nur eine anonyme Adresse, kein Key), die Skills sind schon dabei. Du musst nichts weiter einrichten.</small></p>');
 }
 function errHtml(msg) {
-  return page('buildbar – Hinweis', '<h1>Hoppla</h1><p>' + msg + '</p><p><a href="/">zurück zum Formular</a></p>');
+  return page('buildbar: Hinweis', '<h1>Hoppla</h1><p>' + msg + '</p><p><a href="/">zurück zum Formular</a></p>');
 }
