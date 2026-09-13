@@ -199,6 +199,7 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
   if (!rec || !rec.repo) return res.status(404).json({ error: 'unbekannter Token oder kein Repo hinterlegt' });
   const keyUuid = rec.deployKeyUuid || DEPLOY_KEY_UUID;
   if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER || !keyUuid) return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert (kein Deploy-Key)' });
+  let envFailed = [];
   try {
     if (!rec.appUuid) {
       const sub = 'app-' + token.slice(0, 8);
@@ -216,17 +217,28 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
       rec.appUuid = app.uuid; rec.appDomain = domain; rec.baseDir = baseDir;
       await cf('/applications/' + rec.appUuid, { method: 'PATCH', body: JSON.stringify({ domains: domain }) });
       // optionale Env-Variablen (KEY=VALUE je Zeile) VOR dem ersten Build setzen (z.B. NEXT_PUBLIC_SUPABASE_URL, Anon-Key, n8n-Webhook)
+      // ENV per Bulk-Upsert. Frueher Einzel-POST mit is_build_time -> Coolify 4.3.10: 422, verschluckt,
+      // jede Variable ging lautlos verloren. Ohne das Feld gilt sie fuer Build UND Laufzeit.
       const envRaw = String((req.body && req.body.env) || '');
+      const envData = [];
       for (const line of envRaw.split(/\r?\n/)) {
         const i = line.indexOf('='); if (i < 1) continue;
         const k = line.slice(0, i).trim(), v = line.slice(i + 1).trim();
         if (!k) continue;
-        try { await cf('/applications/' + rec.appUuid + '/envs', { method: 'POST', body: JSON.stringify({ key: k, value: v, is_preview: false, is_build_time: true }) }); } catch (e) {}
+        envData.push({ key: k, value: v, is_preview: false });
+      }
+      if (envData.length) {
+        try {
+          const er = await cf('/applications/' + rec.appUuid + '/envs/bulk', { method: 'PATCH', body: JSON.stringify({ data: envData }) });
+          if (!er.ok) envFailed = envData.map((d) => d.key + ' (HTTP ' + er.status + ')');
+        } catch (e) { envFailed = envData.map((d) => d.key); }
       }
       store.set(token, rec); persist();
     }
     await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
-    res.json({ url: rec.appDomain, app: rec.appUuid, status: 'deploying', hint: 'Erster Build dauert 1-2 Minuten.' });
+    const out = { url: rec.appDomain, app: rec.appUuid, status: 'deploying', hint: 'Erster Build dauert 1-2 Minuten.' };
+    if (envFailed.length) { out.env_failed = envFailed; out.warning = 'Diese Umgebungsvariablen konnten nicht gesetzt werden. Die App startet ohne sie.'; }
+    res.json(out);
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
   }
