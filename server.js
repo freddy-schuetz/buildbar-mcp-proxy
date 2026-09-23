@@ -96,9 +96,42 @@ app.post('/start', express.urlencoded({ extended: false, limit: '16kb' }), (req,
   res.redirect(authUrl);
 });
 
+// Deploy-Key nachtragen: startet dieselbe GitHub-Anmeldung wie beim Anlegen, macht aber NUR
+// den Schluessel. Der Assistent der Person kann diesen Link erzeugen und weiterreichen -
+// klicken muss ihn die Person selbst, denn ohne ihre Zustimmung darf niemand einen
+// Deploy-Key in ihr Repository setzen.
+app.get('/schluessel/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const rec = store.get(token);
+  if (!rec || !rec.repo) return res.status(404).type('html').send(errHtml('Unbekannter Zugang oder noch kein Repository hinterlegt.'));
+  if (!GH_CLIENT_ID || !GH_CLIENT_SECRET) return res.status(503).type('html').send(errHtml('Die GitHub-Anmeldung ist auf diesem Hub nicht konfiguriert.'));
+  const authUrl = 'https://github.com/login/oauth/authorize'
+    + '?client_id=' + encodeURIComponent(GH_CLIENT_ID)
+    + '&scope=repo'
+    + '&state=' + encodeURIComponent('fix:' + token)
+    + '&redirect_uri=' + encodeURIComponent(HUB_BASE + '/auth/callback');
+  res.redirect(authUrl);
+});
+
+// Der Assistent holt sich den Link hier ab, statt ihn zusammenzubauen.
+app.post('/deploykey', express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' }), (req, res) => {
+  const token = String((req.body && req.body.token) || '').trim();
+  const rec = store.get(token);
+  if (!rec) return res.status(404).json({ error: 'unbekannter Token' });
+  if (!rec.repo) return res.status(409).json({ error: 'Zu diesem Zugang ist kein Repository hinterlegt.' });
+  const link = HUB_BASE + '/schluessel/' + token;
+  if (rec.deployKeyUuid || DEPLOY_KEY_UUID) {
+    return res.json({ status: 'vorhanden', repo: rec.repo, link,
+      hinweis: 'Ein Deploy-Key ist hinterlegt. Scheitert das Veroeffentlichen trotzdem am Klonen, fehlt der oeffentliche Teil im Repository - dann diesen Link einmal oeffnen.' });
+  }
+  res.json({ status: 'fehlt', repo: rec.repo, link,
+    hinweis: 'Diesen Link der Person geben. Sie meldet sich einmal bei GitHub an, danach traegt der Hub den Deploy-Key selbst ein. Anschliessend /deploy wiederholen.' });
+});
+
 app.get('/auth/callback', async (req, res) => {
   const code = String(req.query.code || '');
   const state = String(req.query.state || '');
+  if (state.startsWith('fix:')) return schluesselCallback(code, state.slice(4), res);
   const tenant = store.get(state);
   if (!code || !tenant) return res.status(400).type('html').send(errHtml('Sitzung abgelaufen oder ungueltig. Bitte von vorne beginnen.'));
   try {
@@ -199,6 +232,9 @@ app.get('/auth/callback', async (req, res) => {
 // Legt ein Schluesselpaar an, hinterlegt den privaten Teil in Coolify und merkt sich die UUID.
 // Der oeffentliche Teil wird zurueckgegeben - ihn traegt die Person selbst ins Repo ein.
 async function schluesselAnlegen(rec, token) {
+  // Schon einer vorbereitet? Dann den nehmen, statt bei jedem Versuch einen neuen
+  // Schluessel in Coolify liegen zu lassen.
+  if (rec.pendingKey && rec.pendingKey.uuid && rec.pendingKey.pub) return rec.pendingKey;
   try {
     const fs = require('fs');
     const kp = '/tmp/dk-nach-' + token.slice(0, 8);
@@ -212,13 +248,53 @@ async function schluesselAnlegen(rec, token) {
     });
     const kj = await kr.json().catch(() => ({}));
     if (!kj || !kj.uuid) return null;
-    rec.deployKeyUuid = kj.uuid;
+    // Noch NICHT als gueltig vermerken: gueltig ist er erst, wenn der oeffentliche Teil
+    // im Repository liegt. Sonst laeuft der naechste Build in ein Klon-Problem statt in
+    // eine Meldung, die sagt, was zu tun ist.
+    rec.pendingKey = { uuid: kj.uuid, pub };
     delete rec.deployKeyFehler;
     store.set(token, rec);
     persist();
-    return { uuid: kj.uuid, pub };
+    return rec.pendingKey;
   } catch (e) {
     return null;
+  }
+}
+
+// Rueckweg der Schluessel-Nachtragung: NUR den Deploy-Key setzen, kein Repo anlegen,
+// keine .mcp.json anfassen. Das GitHub-Token wird nur fuer diesen einen Aufruf benutzt
+// und nirgends gespeichert.
+async function schluesselCallback(code, token, res) {
+  const rec = store.get(token);
+  if (!code || !rec || !rec.repo) {
+    return res.status(400).type('html').send(errHtml('Sitzung abgelaufen oder ungueltig. Bitte den Link neu anfordern.'));
+  }
+  try {
+    const tr = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ client_id: GH_CLIENT_ID, client_secret: GH_CLIENT_SECRET, code, redirect_uri: HUB_BASE + '/auth/callback' }),
+    });
+    const ght = (await tr.json()).access_token;
+    if (!ght) throw new Error('GitHub hat kein Zugriffstoken geliefert.');
+    const neu = await schluesselAnlegen(rec, token);
+    if (!neu) throw new Error('Der Schluessel liess sich in Coolify nicht hinterlegen.');
+    const kr = await fetch('https://api.github.com/repos/' + rec.repo + '/keys', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + ght, Accept: 'application/vnd.github+json', 'User-Agent': 'buildbar-hub', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'buildbar-deploy', key: neu.pub, read_only: true }),
+    });
+    if (kr.status >= 300) throw new Error('GitHub hat den Deploy-Key abgelehnt (' + kr.status + '): ' + (await kr.text()).slice(0, 160));
+    // Jetzt liegt er im Repo - erst damit gilt er.
+    rec.deployKeyUuid = neu.uuid;
+    delete rec.pendingKey;
+    store.set(token, rec);
+    persist();
+    res.type('html').send(page('Deploy-Key eingetragen', '<h1>Fertig</h1>' +
+      '<p>Der Deploy-Key liegt jetzt in <code>' + rec.repo + '</code>, nur mit Leserecht.</p>' +
+      '<p>Geh zurueck in deine Sitzung und sag: <strong>„veroeffentliche meine App nochmal"</strong>.</p>'));
+  } catch (e) {
+    res.status(500).type('html').send(errHtml('Der Deploy-Key konnte nicht gesetzt werden: ' + String((e && e.message) || e)));
   }
 }
 
@@ -262,19 +338,17 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
   if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER) {
     return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert (Coolify fehlt)' });
   }
+  // Ein vorbereiteter Schluessel gilt erst, wenn sein oeffentlicher Teil im Repo liegt.
+  // Genau das erledigt der Link unten; danach genuegt derselbe /deploy-Aufruf noch einmal.
   let keyUuid = rec.deployKeyUuid || DEPLOY_KEY_UUID;
   if (!keyUuid) {
     // Frueher endete das hier mit 503 und niemand kam weiter. Jetzt legt der Hub den
     // Schluessel nach und sagt genau, was noch fehlt: der oeffentliche Teil im Repo.
     // Den kann nur die Person selbst setzen - der Hub hat ihren GitHub-Zugang nicht mehr.
-    const neu = await schluesselAnlegen(rec, token);
-    if (!neu) return res.status(503).json({ error: 'Deploy-Key liess sich nicht anlegen. Bitte Friedemann Bescheid sagen.' });
     return res.status(409).json({
-      error: 'Es fehlt der Deploy-Key im Repository. Er ist jetzt vorbereitet, muss aber einmal dort eingetragen werden.',
-      public_key: neu.pub,
-      einmal_ausfuehren:
-        'gh api repos/' + rec.repo + '/keys -f title=buildbar-deploy -f "key=' + neu.pub + '" -F read_only=true',
-      danach: 'Danach denselben /deploy-Aufruf einfach wiederholen.',
+      error: 'Es fehlt der Deploy-Key im Repository.',
+      link: HUB_BASE + '/schluessel/' + token,
+      so_gehts: 'Gib der Person diesen Link. Sie meldet sich dort einmal bei GitHub an, danach traegt der Hub den Deploy-Key selbst ein (nur Leserecht). Anschliessend denselben /deploy-Aufruf wiederholen.',
     });
   }
   let envFailed = [];
