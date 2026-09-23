@@ -177,7 +177,13 @@ app.get('/auth/callback', async (req, res) => {
         const kj = await kr.json().catch(() => ({}));
         await gh('/repos/' + owner + '/' + name + '/keys', { method: 'POST', body: JSON.stringify({ title: 'buildbar-deploy', key: pub, read_only: true }) });
         if (kj && kj.uuid) tenant.deployKeyUuid = kj.uuid;
-      } catch (e) { /* nicht kritisch */ }
+        else tenant.deployKeyFehler = 'Coolify hat den Schluessel nicht angenommen (HTTP ' + kr.status + ')';
+      } catch (e) {
+        // NICHT verschlucken: ohne Schluessel scheitert spaeter jedes /deploy mit 503,
+        // und niemand weiss mehr, warum. Am 21.09. war der Coolify-Token weg - der
+        // Fehlschlag fiel erst zwei Tage spaeter beim Veroeffentlichen auf.
+        tenant.deployKeyFehler = String((e && e.message) || e).slice(0, 200);
+      }
     }
     // Repo (+ Deploy-Key-UUID) mit dem Verbindungs-Token merken (fuer /deploy)
     tenant.repo = owner + '/' + name;
@@ -190,6 +196,62 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
+// Legt ein Schluesselpaar an, hinterlegt den privaten Teil in Coolify und merkt sich die UUID.
+// Der oeffentliche Teil wird zurueckgegeben - ihn traegt die Person selbst ins Repo ein.
+async function schluesselAnlegen(rec, token) {
+  try {
+    const fs = require('fs');
+    const kp = '/tmp/dk-nach-' + token.slice(0, 8);
+    require('child_process').execSync("ssh-keygen -t ed25519 -N '' -q -f " + kp + ' -C buildbar-nachtrag');
+    const pub = fs.readFileSync(kp + '.pub', 'utf8').trim();
+    const priv = fs.readFileSync(kp, 'utf8');
+    try { fs.unlinkSync(kp); fs.unlinkSync(kp + '.pub'); } catch (e) {}
+    const kr = await cf('/security/keys', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'deploy-nachtrag-' + token.slice(0, 8), private_key: priv }),
+    });
+    const kj = await kr.json().catch(() => ({}));
+    if (!kj || !kj.uuid) return null;
+    rec.deployKeyUuid = kj.uuid;
+    delete rec.deployKeyFehler;
+    store.set(token, rec);
+    persist();
+    return { uuid: kj.uuid, pub };
+  } catch (e) {
+    return null;
+  }
+}
+
+// --- Ausgang des letzten Builds: ohne das sieht die Person nur eine Fehlerseite ---
+app.post('/status', express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' }), async (req, res) => {
+  const token = String((req.body && req.body.token) || '').trim();
+  const rec = store.get(token);
+  if (!rec) return res.status(404).json({ error: 'unbekannter Token' });
+  if (!rec.appUuid) return res.json({ status: 'noch nichts veroeffentlicht' });
+  if (!rec.lastDeployment) return res.json({ url: rec.appDomain, status: 'unbekannt', hinweis: 'Nach dem naechsten /deploy steht der Ausgang hier.' });
+  try {
+    const r = await cf('/deployments/' + rec.lastDeployment);
+    const j = await r.json().catch(() => ({}));
+    let zeilen = [];
+    try {
+      zeilen = JSON.parse(j.logs || '[]').map((e) => String(e.output || '').replace(/\s+$/, '')).filter(Boolean);
+    } catch (e) { zeilen = []; }
+    res.json({
+      url: rec.appDomain,
+      status: j.status || 'unbekannt',
+      commit: (j.commit || '').slice(0, 7),
+      // Fehlerzeilen nur bei echtem Fehlschlag: erfolgreiche Builds enthalten harmlose
+      // Aufraeum-Meldungen, die sonst falschen Alarm ausloesen.
+      fehlerzeilen: j.status === 'failed'
+        ? zeilen.filter((z) => /error|failed|not a directory|exit code/i.test(z)).slice(-8).map((z) => z.slice(0, 300))
+        : [],
+      letzte_zeilen: zeilen.slice(-20).map((z) => z.slice(0, 300)),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
+  }
+});
+
 // --- On-Demand Frontend-Deploy: Coolify-App aus dem Repo (nur wenn der Teilnehmer es will) ---
 app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' }), async (req, res) => {
   const token = String((req.body && req.body.token) || '').trim();
@@ -197,8 +259,24 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
   if (baseDir[0] !== '/') baseDir = '/' + baseDir;
   const rec = store.get(token);
   if (!rec || !rec.repo) return res.status(404).json({ error: 'unbekannter Token oder kein Repo hinterlegt' });
-  const keyUuid = rec.deployKeyUuid || DEPLOY_KEY_UUID;
-  if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER || !keyUuid) return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert (kein Deploy-Key)' });
+  if (!COOLIFY_TOKEN || !COOLIFY_PROJECT || !COOLIFY_SERVER) {
+    return res.status(503).json({ error: 'Deploy ist auf diesem Hub nicht konfiguriert (Coolify fehlt)' });
+  }
+  let keyUuid = rec.deployKeyUuid || DEPLOY_KEY_UUID;
+  if (!keyUuid) {
+    // Frueher endete das hier mit 503 und niemand kam weiter. Jetzt legt der Hub den
+    // Schluessel nach und sagt genau, was noch fehlt: der oeffentliche Teil im Repo.
+    // Den kann nur die Person selbst setzen - der Hub hat ihren GitHub-Zugang nicht mehr.
+    const neu = await schluesselAnlegen(rec, token);
+    if (!neu) return res.status(503).json({ error: 'Deploy-Key liess sich nicht anlegen. Bitte Friedemann Bescheid sagen.' });
+    return res.status(409).json({
+      error: 'Es fehlt der Deploy-Key im Repository. Er ist jetzt vorbereitet, muss aber einmal dort eingetragen werden.',
+      public_key: neu.pub,
+      einmal_ausfuehren:
+        'gh api repos/' + rec.repo + '/keys -f title=buildbar-deploy -f "key=' + neu.pub + '" -F read_only=true',
+      danach: 'Danach denselben /deploy-Aufruf einfach wiederholen.',
+    });
+  }
   let envFailed = [];
   try {
     if (!rec.appUuid) {
@@ -235,8 +313,12 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
       }
       store.set(token, rec); persist();
     }
-    await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
+    const dr = await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
+    const dj = await dr.json().catch(() => ({}));
+    const du = dj && dj.deployments && dj.deployments[0] && dj.deployments[0].deployment_uuid;
+    if (du) { rec.lastDeployment = du; store.set(token, rec); persist(); }
     const out = { url: rec.appDomain, app: rec.appUuid, status: 'deploying', hint: 'Erster Build dauert 1-2 Minuten.' };
+    out.pruefen = 'Antwortet die Adresse nicht: POST /status mit demselben token zeigt Ausgang und Fehlerzeilen des Builds.';
     if (envFailed.length) { out.env_failed = envFailed; out.warning = 'Diese Umgebungsvariablen konnten nicht gesetzt werden. Die App startet ohne sie.'; }
     res.json(out);
   } catch (e) {
