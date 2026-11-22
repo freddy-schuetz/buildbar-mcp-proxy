@@ -75,11 +75,24 @@ app.use((req, res, next) => {
   proxy.web(req, res, { target: UPSTREAM });
 });
 
+// Seiten des Hubs nicht in fremde Rahmen einbetten lassen (Klick-Untergeschoben).
+app.use((req, res, next) => { res.setHeader('X-Frame-Options', 'DENY'); next(); });
+
+// Formulare, die n8n-Adresse und Schluessel setzen, nur von der eigenen Seite annehmen. Browser schicken bei
+// einem POST von einer fremden Seite immer einen Origin-Kopf mit (oder "null"); ohne diese Pruefung koennte eine
+// fremde Seite nach einer bereits erteilten GitHub-Freigabe still eine andere n8n hinterlegen.
+const HUB_ORIGIN = (() => { try { return new URL(HUB_BASE).origin; } catch (e) { return ''; } })();
+function fremdeHerkunft(req) {
+  const o = req.headers.origin;
+  return o !== undefined && o !== HUB_ORIGIN;
+}
+
 // ---------- Onboarding: Formular -> GitHub-Anmeldung -> fertiges Repo ----------
 app.get('/', (req, res) => res.type('html').send(formHtml()));
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
 
 app.post('/start', express.urlencoded({ extended: false, limit: '16kb' }), (req, res) => {
+  if (fremdeHerkunft(req)) return res.status(403).type('html').send(errHtml('Bitte das Formular direkt auf ' + HUB_BASE + ' abschicken.'));
   const url = String((req.body && req.body.url) || '').trim().replace(/\/+$/, '');
   const key = String((req.body && req.body.key) || '').trim();
   if (!/^https:\/\/[^\s/]+\.[^\s]+$/i.test(url)) return res.status(400).type('html').send(errHtml('Bitte eine gültige n8n-URL (https://…) eingeben.'));
@@ -139,6 +152,7 @@ const ERNEUERN_FRIST_MS = 15 * 60 * 1000;
 app.get('/erneuern', (req, res) => res.type('html').send(erneuernHtml()));
 
 app.post('/erneuern', express.urlencoded({ extended: false, limit: '16kb' }), (req, res) => {
+  if (fremdeHerkunft(req)) return res.status(403).type('html').send(errHtml('Bitte das Formular direkt auf ' + HUB_BASE + ' abschicken.'));
   const url = String((req.body && req.body.url) || '').trim().replace(/\/+$/, '');
   const key = String((req.body && req.body.key) || '').trim();
   if (url && !/^https:\/\/[^\s/]+\.[^\s]+$/i.test(url)) return res.status(400).type('html').send(errHtml('Bitte eine gültige Adresse (https://…) eingeben oder das Feld leer lassen.'));
