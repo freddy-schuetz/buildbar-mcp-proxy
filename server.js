@@ -128,10 +128,81 @@ app.post('/deploykey', express.urlencoded({ extended: false, limit: '16kb' }), e
     hinweis: 'Diesen Link der Person geben. Sie meldet sich einmal bei GitHub an, danach traegt der Hub den Deploy-Key selbst ein. Anschliessend /deploy wiederholen.' });
 });
 
+// ---------- n8n-Schluessel erneuern (TCF) ----------
+// Schluessel in one.intelligence laufen ab. Damit das Projekt nach dem Bootcamp verbunden bleibt,
+// hinterlegt die Person hier einen neuen. Wer sie ist, zeigt die GitHub-Anmeldung: Geaendert werden
+// nur Zugaenge, deren Repository diesem GitHub-Konto gehoert. Der neue Schluessel wartet hoechstens
+// 15 Minuten im Speicher und wird nirgends ausgegeben.
+const erneuernOffen = new Map(); // state -> { url, key, t }
+const ERNEUERN_FRIST_MS = 15 * 60 * 1000;
+
+app.get('/erneuern', (req, res) => res.type('html').send(erneuernHtml()));
+
+app.post('/erneuern', express.urlencoded({ extended: false, limit: '16kb' }), (req, res) => {
+  const url = String((req.body && req.body.url) || '').trim().replace(/\/+$/, '');
+  const key = String((req.body && req.body.key) || '').trim();
+  if (url && !/^https:\/\/[^\s/]+\.[^\s]+$/i.test(url)) return res.status(400).type('html').send(errHtml('Bitte eine gültige Adresse (https://…) eingeben oder das Feld leer lassen.'));
+  if (key.length < 20) return res.status(400).type('html').send(errHtml('Der API-Schlüssel sieht zu kurz aus. Bitte prüfen.'));
+  if (!GH_CLIENT_ID || !GH_CLIENT_SECRET) return res.status(503).type('html').send(errHtml('Die GitHub-Anmeldung ist auf diesem Hub noch nicht konfiguriert.'));
+  const jetzt = Date.now();
+  for (const [k, v] of erneuernOffen) if (jetzt - v.t > ERNEUERN_FRIST_MS) erneuernOffen.delete(k);
+  const state = 'neu:' + crypto.randomBytes(16).toString('hex');
+  erneuernOffen.set(state, { url, key, t: jetzt });
+  const authUrl = 'https://github.com/login/oauth/authorize'
+    + '?client_id=' + encodeURIComponent(GH_CLIENT_ID)
+    + '&scope=read%3Auser'
+    + '&state=' + encodeURIComponent(state)
+    + '&redirect_uri=' + encodeURIComponent(HUB_BASE + '/auth/callback');
+  res.redirect(authUrl);
+});
+
+async function erneuernCallback(code, state, res) {
+  const offen = erneuernOffen.get(state);
+  erneuernOffen.delete(state);
+  if (!code || !offen || Date.now() - offen.t > ERNEUERN_FRIST_MS) {
+    return res.status(400).type('html').send(errHtml('Sitzung abgelaufen oder ungültig. Bitte <a href="/erneuern">von vorne beginnen</a>.'));
+  }
+  try {
+    const tr = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ client_id: GH_CLIENT_ID, client_secret: GH_CLIENT_SECRET, code, redirect_uri: HUB_BASE + '/auth/callback' }),
+    });
+    const ght = (await tr.json()).access_token;
+    if (!ght) throw new Error('GitHub hat kein Zugriffstoken geliefert.');
+    const me = await fetch('https://api.github.com/user', {
+      headers: { Authorization: 'Bearer ' + ght, Accept: 'application/vnd.github+json', 'User-Agent': 'buildbar-hub' },
+    });
+    const login = me.ok ? (await me.json()).login : null;
+    if (!login) throw new Error('GitHub-Login nicht ermittelbar.');
+    const praefix = String(login).toLowerCase() + '/';
+    const geaendert = [];
+    for (const [token, rec] of store) {
+      if (!rec || !rec.repo || !String(rec.repo).toLowerCase().startsWith(praefix)) continue;
+      rec.key = offen.key;
+      if (offen.url) rec.url = offen.url;
+      store.set(token, rec);
+      geaendert.push(rec.repo);
+    }
+    if (!geaendert.length) {
+      return res.status(404).type('html').send(errHtml('Zu deinem GitHub-Konto (' + login + ') gibt es auf diesem Hub kein Projekt. Leg es über das <a href="/">Formular</a> neu an.'));
+    }
+    persist();
+    console.log('n8n-Schluessel erneuert fuer', geaendert.length, 'Projekt(e) von', login);
+    res.type('html').send(page('buildbar: Schlüssel erneuert', '<h1>Neuer Schlüssel hinterlegt</h1>' +
+      '<p>Für ' + (geaendert.length === 1 ? 'dein Projekt' : 'deine Projekte') + ' gilt ab sofort der neue n8n-Schlüssel:</p>' +
+      '<div class="box"><code>' + geaendert.join('</code><br><code>') + '</code></div>' +
+      '<p>Starte in Claude eine neue Sitzung, dann ist die Verbindung wieder da.</p>'));
+  } catch (e) {
+    res.status(500).type('html').send(errHtml('Der Schlüssel konnte nicht erneuert werden: ' + String((e && e.message) || e)));
+  }
+}
+
 app.get('/auth/callback', async (req, res) => {
   const code = String(req.query.code || '');
   const state = String(req.query.state || '');
   if (state.startsWith('fix:')) return schluesselCallback(code, state.slice(4), res);
+  if (state.startsWith('neu:')) return erneuernCallback(code, state, res);
   const tenant = store.get(state);
   if (!code || !tenant) return res.status(400).type('html').send(errHtml('Sitzung abgelaufen oder ungueltig. Bitte von vorne beginnen.'));
   try {
@@ -403,26 +474,40 @@ app.post('/deploy', express.urlencoded({ extended: false, limit: '16kb' }), expr
 app.listen(PORT, () => console.log('buildbar hub on', PORT, '-> upstream', UPSTREAM, GH_CLIENT_ID ? '(GitHub aktiv)' : '(GitHub NICHT konfiguriert)'));
 
 // ---------- HTML ----------
-const CSS = 'body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:660px;margin:6vh auto;padding:0 20px;color:#141414;line-height:1.55}h1{font-size:1.6rem}h2{font-size:1.15rem;margin-top:26px}label{display:block;font-weight:600;margin:18px 0 6px}input{width:100%;padding:12px;font-size:1rem;border:1px solid #c4c4c4;border-radius:8px;box-sizing:border-box}small{color:#555;display:block;margin-top:5px}button{margin-top:26px;padding:14px 24px;font-size:1rem;font-weight:600;background:#111;color:#fff;border:0;border-radius:8px;cursor:pointer}.box{background:#f5f5f5;border-radius:10px;padding:16px 18px;margin-top:14px;overflow-x:auto}code{background:#ececec;padding:2px 5px;border-radius:4px;word-break:break-all}a{color:#0b57d0}ol li{margin:8px 0}';
+const CSS = 'body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:660px;margin:6vh auto;padding:0 20px;color:#141414;line-height:1.55}h1{font-size:1.6rem}h2{font-size:1.15rem;margin-top:26px}label{display:block;font-weight:600;margin:18px 0 6px}input{width:100%;padding:12px;font-size:1rem;border:1px solid #c4c4c4;border-radius:8px;box-sizing:border-box}small{color:#555;display:block;margin-top:5px}button{margin-top:26px;padding:14px 24px;font-size:1rem;font-weight:600;background:#db0b0b;color:#fff;border:0;border-radius:8px;cursor:pointer}.box{background:#f5f5f5;border-radius:10px;padding:16px 18px;margin-top:14px;overflow-x:auto}code{background:#ececec;padding:2px 5px;border-radius:4px;word-break:break-all}a{color:#ae0f0a}ol li{margin:8px 0}';
 
 function page(title, body) {
   return '<!doctype html><html lang="de"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>' + title + '</title><style>' + CSS + '</style></head><body>' + body + '</body></html>';
 }
+function erneuernHtml() {
+  return page('buildbar: n8n-Schlüssel erneuern',
+    '<h1>n8n-Schlüssel erneuern</h1>' +
+    '<p>Ist dein API-Schlüssel abgelaufen oder hast du einen neuen angelegt? Hier hinterlegst du ihn für dein bestehendes Projekt. Mit der GitHub-Anmeldung zeigst du, dass es deins ist.</p>' +
+    '<form method="post" action="/erneuern">' +
+    '<label>1. Dein neuer n8n-API-Schlüssel</label>' +
+    '<input name="key" placeholder="eyJ..." required>' +
+    '<small>In n8n unter Einstellungen, dann „n8n API“, dann „Create API Key“. Wähl eine lange Laufzeit.</small>' +
+    '<label>2. Adresse deiner n8n (nur wenn sie sich geändert hat)</label>' +
+    '<input name="url" inputmode="url" placeholder="leer lassen, wenn gleich">' +
+    '<button type="submit">Weiter mit GitHub →</button>' +
+    '</form>');
+}
 function formHtml() {
   return page('buildbar: n8n verbinden',
     '<h1>Dein Bootcamp-Projekt einrichten</h1>' +
-    '<p>AI Automation Bootcamp der Österreich Werbung. Zwei Angaben und eine GitHub-Anmeldung, danach bekommst du ein <b>fertig verbundenes</b> Projekt. Der API-Key bleibt <b>auf dem Server</b> und landet nie in einem Repository.</p>' +
+    '<p>AI Automation Bootcamp der Tourismus+Congress GmbH Frankfurt am Main. Zwei Angaben und eine GitHub-Anmeldung, danach bekommst du ein <b>fertig verbundenes</b> Projekt. Der API-Schlüssel bleibt <b>auf dem Server</b> und landet nie in einem Repository.</p>' +
     '<form method="post" action="/start">' +
-    '<label>1. Deine n8n-URL</label>' +
-    '<input name="url" inputmode="url" placeholder="https://n8n-oew.buildbar.at" required>' +
-    '<small>Die Adresse der n8n ohne / am Ende. Für die zentrale Bootcamp-n8n steht sie im Zugangsbereich auf buildbar.at/oew.</small>' +
-    '<label>2. Dein n8n API-Key</label>' +
+    '<label>1. Adresse deiner n8n in one.intelligence</label>' +
+    '<input name="url" inputmode="url" placeholder="https://…" required>' +
+    '<small>Die Adresse eurer n8n, wie sie oben im Browser steht, aber nur der Anfang ohne / am Ende.</small>' +
+    '<label>2. Dein n8n-API-Schlüssel</label>' +
     '<input name="key" placeholder="eyJ..." required>' +
-    '<small>Zentrale Bootcamp-n8n: API-Key aus dem Zugangsbereich. Eigene n8n: Einstellungen, n8n API, API Key erstellen. Die kostenlose n8n-Cloud-Testversion hat keinen API-Zugang.</small>' +
+    '<small>In n8n unter Einstellungen, dann „n8n API“, dann „Create API Key“. Wähl eine lange Laufzeit, damit dein Projekt auch nach dem Bootcamp verbunden bleibt.</small>' +
     '<button type="submit">Weiter mit GitHub →</button>' +
     '<small style="margin-top:14px">Im nächsten Schritt meldest du dich bei GitHub an. buildbar legt dir damit dein privates Projekt-Repository an.</small>' +
+    '<small style="margin-top:14px">Schon ein Projekt und nur einen neuen n8n-Schlüssel? <a href="/erneuern">Schlüssel erneuern</a></small>' +
     '</form>');
 }
 function doneHtml(repoUrl, fullName) {
@@ -433,6 +518,7 @@ function doneHtml(repoUrl, fullName) {
     '<h2>Jetzt loslegen</h2><ol>' +
     '<li>Öffne <a href="https://claude.ai/code" target="_blank" rel="noopener">claude.ai/code</a> und melde dich an.</li>' +
     '<li>Verbinde dort dein GitHub (falls noch nicht) und wähle das Projekt <b>' + fullName + '</b> aus.</li>' +
+    '<li>Vor der ersten Nachricht: Netzwerkzugriff auf <b>„Voll“</b> stellen. Klick unter dem Eingabefeld auf „Default“ mit dem Wolkensymbol, dann auf das Zahnrad daneben, wähl unter „Netzwerkzugriff“ die Stufe „Voll“ und speichere. Sonst erreicht Claude deine n8n nicht.</li>' +
     '<li>Tippe einfach: <b>„Los geht\'s"</b>. Claude begrüßt dich, prüft die Verbindung und fragt nach deinem Vorhaben.</li>' +
     '</ol>' +
     '<p><a href="' + repoUrl + '" target="_blank" rel="noopener">Repo auf GitHub ansehen</a></p>' +
