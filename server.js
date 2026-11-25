@@ -22,6 +22,9 @@ const GH_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 const HUB_BASE = process.env.HUB_BASE || 'https://hub.buildbar.at';
 const REPO_NAME = process.env.REPO_NAME || 'buildbar-hackathon';
 const TEMPLATE_REPO = process.env.TEMPLATE_REPO || 'freddy-schuetz/nrw-tourismus-hackathon-web';
+// Vorbelegte n8n-Adresse im Formular (TCF: die n8n von one.intelligence). Leer = Feld leer wie bisher.
+const N8N_URL_VORGABE = process.env.N8N_URL_VORGABE || '';
+const attr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 // Frontend-Deploy (on-demand)
 const COOLIFY_TOKEN = process.env.COOLIFY_TOKEN || '';
 const COOLIFY_API = process.env.COOLIFY_API || 'http://coolify:8080/api/v1';
@@ -511,14 +514,17 @@ function erneuernHtml() {
 function formHtml() {
   return page('buildbar: n8n verbinden',
     '<h1>Dein Bootcamp-Projekt einrichten</h1>' +
-    '<p>AI Automation Bootcamp der Tourismus+Congress GmbH Frankfurt am Main. Zwei Angaben und eine GitHub-Anmeldung, danach bekommst du ein <b>fertig verbundenes</b> Projekt. Der API-Schlüssel bleibt <b>auf dem Server</b> und landet nie in einem Repository.</p>' +
+    '<p>AI Automation Bootcamp der Tourismus+Congress GmbH Frankfurt am Main. ' + (N8N_URL_VORGABE ? 'Dein n8n-API-Schlüssel' : 'Zwei Angaben') + ' und eine GitHub-Anmeldung, danach bekommst du ein <b>fertig verbundenes</b> Projekt. Der API-Schlüssel bleibt <b>auf dem Server</b> und landet nie in einem Repository.</p>' +
     '<form method="post" action="/start">' +
-    '<label>1. Adresse deiner n8n in one.intelligence</label>' +
-    '<input name="url" inputmode="url" placeholder="https://…" required>' +
-    '<small>Die Adresse eurer n8n, wie sie oben im Browser steht, aber nur der Anfang ohne / am Ende.</small>' +
-    '<label>2. Dein n8n-API-Schlüssel</label>' +
+    '<label>1. Dein n8n-API-Schlüssel</label>' +
     '<input name="key" placeholder="eyJ..." required>' +
     '<small>In n8n unter Einstellungen, dann „n8n API“, dann „Create API Key“. Wähl eine lange Laufzeit, damit dein Projekt auch nach dem Bootcamp verbunden bleibt.</small>' +
+    '<label>2. Adresse deiner n8n in one.intelligence</label>' +
+    (N8N_URL_VORGABE
+      ? '<input name="url" inputmode="url" value="' + attr(N8N_URL_VORGABE) + '" required>' +
+        '<small>Ist schon eingetragen. Nur ändern, wenn deine n8n eine andere Adresse hat.</small>'
+      : '<input name="url" inputmode="url" placeholder="https://…" required>' +
+        '<small>Die Adresse eurer n8n, wie sie oben im Browser steht, aber nur der Anfang ohne / am Ende.</small>') +
     '<button type="submit">Weiter mit GitHub →</button>' +
     '<small style="margin-top:14px">Im nächsten Schritt meldest du dich bei GitHub an. buildbar legt dir damit dein privates Projekt-Repository an.</small>' +
     '<small style="margin-top:14px">Schon ein Projekt und nur einen neuen n8n-Schlüssel? <a href="/erneuern">Schlüssel erneuern</a></small>' +
